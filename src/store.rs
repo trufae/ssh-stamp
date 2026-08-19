@@ -63,8 +63,8 @@ pub fn load_or_create<F>(
 where
     F: NorFlash + ReadStorage,
 {
-    match load(flash, buf) {
-        Ok(mut c) => {
+    match load_checked(flash, buf) {
+        LoadOutcome::Ok(mut c) => {
             debug!("Good existing config");
             if c.wifi_ap_ssid.as_str() == "ssh-stamp" {
                 debug!("Migrating insecure default Access Point SSID, regenerating randomly");
@@ -74,12 +74,23 @@ where
                 }
                 save(flash, buf, &c)?;
             }
-            return Ok(c);
+            Ok(c)
         }
-        Err(e) => debug!("Existing config bad, making new. {e}"),
+        // A config exists but failed the version or integrity check (or the
+        // flash read errored). Recreating here would silently wipe stored
+        // pubkeys, regenerate the host key, and reopen the unauthenticated
+        // first-login window, so refuse rather than fail open.
+        LoadOutcome::Invalid(e) => {
+            error!("Existing config present but invalid; refusing to overwrite it: {e}");
+            Err(e)
+        }
+        // No decodable config at all (blank/erased flash on first boot). This
+        // is the only case where minting a fresh config is the right thing.
+        LoadOutcome::Absent => {
+            debug!("No existing config found, creating a new one");
+            create(flash, buf, default_mac, default_uart_pins)
+        }
     }
-
-    create(flash, buf, default_mac, default_uart_pins)
 }
 
 /// Creates a new `SSHStampConfig` and saves it to flash.
@@ -102,45 +113,84 @@ where
     Ok(c)
 }
 
-/// Loads `SSHStampConfig` from flash.
-///
-/// # Errors
-/// Returns an error if flash read fails, config is invalid, or hash mismatch.
-pub fn load<F>(flash: &mut F, buf: &mut [u8]) -> Result<SSHStampConfig, SunsetError>
+/// Result of attempting to load an existing config from flash.
+enum LoadOutcome {
+    /// A config was decoded and passed the version and integrity checks.
+    Ok(SSHStampConfig),
+    /// No decodable config was present (blank/erased flash, e.g. first boot).
+    /// This is the only outcome for which minting a fresh config is correct.
+    Absent,
+    /// A config was structurally present but failed the version or hash check,
+    /// or the flash read itself errored. The caller must not overwrite it.
+    Invalid(SunsetError),
+}
+
+/// Reads and validates the config from flash, distinguishing "no config yet"
+/// from "a config is present but invalid" so callers can avoid silently
+/// wiping stored keys on the latter.
+fn load_checked<F>(flash: &mut F, buf: &mut [u8]) -> LoadOutcome
 where
     F: ReadStorage,
 {
     // If at some point you target a 64bit arch these can truncate and cause
     // corruption of the bootloader or the ota partition.
-    let offset =
-        u32::try_from(CONFIG_OFFSET).map_err(|_| SunsetError::msg("CONFIG_OFFSET overflow"))?;
+    let offset = match u32::try_from(CONFIG_OFFSET) {
+        Ok(o) => o,
+        Err(_) => return LoadOutcome::Invalid(SunsetError::msg("CONFIG_OFFSET overflow")),
+    };
 
-    flash.read(offset, buf).map_err(|_e| {
+    if flash.read(offset, buf).is_err() {
         error!("flash read error 0x{CONFIG_OFFSET:x}");
-        SunsetError::msg("flash error")
-    })?;
+        // A transient read error is not proof the config is gone; do not wipe.
+        return LoadOutcome::Invalid(SunsetError::msg("flash error"));
+    }
 
-    let (flash_config, _used): (FlashConfig, usize) = sshwire::read_ssh(buf, None)
-        .map_err(|_| SunsetError::msg("failed to decode flash config"))?;
+    // Undecodable bytes mean no config has been written yet (or the region is
+    // erased). This is the only path allowed to fall through to create().
+    let (flash_config, _used): (FlashConfig, usize) = match sshwire::read_ssh(buf, None) {
+        Ok(v) => v,
+        Err(_) => return LoadOutcome::Absent,
+    };
 
     if flash_config.version != SSHStampConfig::CURRENT_VERSION {
         error!("wrong config version on decode: {}", flash_config.version);
-        return Err(SunsetError::msg("wrong config version"));
+        return LoadOutcome::Invalid(SunsetError::msg("wrong config version"));
     }
 
     // OwnOrBorrow::Own is the only variant that can be decoded from bytes
     let config = match flash_config.config {
         OwnOrBorrow::Own(c) => c,
-        OwnOrBorrow::Borrow(_) => return Err(SunsetError::msg("unexpected borrowed config")),
+        OwnOrBorrow::Borrow(_) => {
+            return LoadOutcome::Invalid(SunsetError::msg("unexpected borrowed config"));
+        }
     };
 
-    let calc_hash = config_hash(&config)?;
+    let calc_hash = match config_hash(&config) {
+        Ok(h) => h,
+        Err(e) => return LoadOutcome::Invalid(e),
+    };
 
     if calc_hash != flash_config.hash {
-        return Err(SunsetError::msg("bad config hash"));
+        return LoadOutcome::Invalid(SunsetError::msg("bad config hash"));
     }
 
-    Ok(config)
+    LoadOutcome::Ok(config)
+}
+
+/// Loads `SSHStampConfig` from flash.
+///
+/// # Errors
+/// Returns an error if flash read fails, config is absent, invalid, or the
+/// hash mismatches.
+pub fn load<F>(flash: &mut F, buf: &mut [u8]) -> Result<SSHStampConfig, SunsetError>
+where
+    F: ReadStorage,
+{
+    match load_checked(flash, buf) {
+        LoadOutcome::Ok(c) => Ok(c),
+        LoadOutcome::Absent => Err(SunsetError::msg("failed to decode flash config")),
+        LoadOutcome::Invalid(e) => Err(e),
+    }
 }
 
 /// Saves `SSHStampConfig` to flash.
