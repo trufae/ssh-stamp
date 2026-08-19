@@ -211,14 +211,19 @@ where
     let l = sshwire::write_ssh(buf, &sc)?;
     debug!("Saved flash (after write_ssh): {}", buf[..l].hex_dump());
 
-    debug!(
-        "CONFIG_OFFSET + FlashConfig::BUF_SIZE = {}",
-        CONFIG_OFFSET + FlashConfig::BUF_SIZE
-    );
-
     debug!("Erasing flash");
 
     const { assert!(CONFIG_AREA_SIZE > FlashConfig::BUF_SIZE) };
+
+    // Write only the encoded config, rounded up to the flash write
+    // granularity, instead of the entire caller buffer. Writing the whole
+    // buffer persisted stale trailing RAM to flash and, for a buffer larger
+    // than the config area, would write past the erased region into the
+    // adjacent partition (NVS/PHY on ESP32).
+    let write_len = l
+        .checked_next_multiple_of(F::WRITE_SIZE)
+        .filter(|n| *n <= buf.len() && *n <= CONFIG_AREA_SIZE)
+        .ok_or_else(|| SunsetError::msg("encoded config too large for flash area"))?;
 
     let offset =
         u32::try_from(CONFIG_OFFSET).map_err(|_| SunsetError::msg("CONFIG_OFFSET overflow"))?;
@@ -230,7 +235,7 @@ where
         SunsetError::msg("flash erase error")
     })?;
 
-    flash.write(offset, buf).map_err(|_e| {
+    flash.write(offset, &buf[..write_len]).map_err(|_e| {
         error!("flash write error");
         SunsetError::msg("flash write error")
     })?;
