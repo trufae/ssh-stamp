@@ -7,7 +7,6 @@
 use embedded_storage::ReadStorage;
 use embedded_storage::nor_flash::NorFlash;
 
-use pretty_hex::PrettyHex;
 use ssh_key::sha2::Digest;
 
 use log::{debug, error};
@@ -108,7 +107,8 @@ where
 {
     let c = SSHStampConfig::new(default_mac, default_uart_pins)?;
     save(flash, buf, &c)?;
-    debug!("Created new config: {c:?}");
+    // Don't Debug-print the config: it contains the host private key.
+    debug!("Created new config");
 
     Ok(c)
 }
@@ -207,9 +207,9 @@ where
         hash: config_hash(config)?,
     };
 
-    debug!("Before write_ssh, with hash: {}", sc.hash.hex_dump());
+    // NB: do not hex_dump `buf` here — the serialized config begins with the
+    // Ed25519 host private key and contains the WiFi passwords.
     let l = sshwire::write_ssh(buf, &sc)?;
-    debug!("Saved flash (after write_ssh): {}", buf[..l].hex_dump());
 
     debug!("Erasing flash");
 
