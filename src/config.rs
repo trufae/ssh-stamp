@@ -315,8 +315,10 @@ where
         let ad: [u8; 16] = SSHDecode::dec(s)?;
         let ad = Ipv6Addr::from(ad);
         let prefix = SSHDecode::dec(s)?;
-        if prefix > 32 {
-            // embassy panics, so test it here
+        if prefix > 128 {
+            // embassy panics on an out-of-range prefix, so reject it here.
+            // IPv6 prefixes are 0..=128 (this used to check the IPv4 bound of
+            // 32, which rejected every normal address, e.g. a /64).
             return Err(WireError::PacketWrong);
         }
         let gw: Option<[u8; 16]> = dec_option(s)?;
