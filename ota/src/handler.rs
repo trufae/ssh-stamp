@@ -302,7 +302,7 @@ impl<W: OtaActions> UpdateProcessor<W> {
                 "UpdateProcessor: Checksum mismatch after download! Expected: {original_hash:x?}`"
             );
             self.state = UpdateProcessorState::Error(OtaError::VerificationFailed);
-            return Ok(());
+            return Err(OtaError::VerificationFailed);
         }
         Ok(())
     }
